@@ -4,11 +4,14 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
+
+# ckpts store hparams as argparse.Namespace; torch >= 2.6 blocks it by default.
+torch.serialization.add_safe_globals([argparse.Namespace])
 from Bio.PDB import PDBParser
 from rdkit import Chem
 import pandas as pd
 import random
-from torch_scatter import scatter_mean
+from scatter_ops import scatter_mean
 from openbabel import openbabel
 openbabel.obErrorLog.StopLogging()  # suppress OpenBabel messages
 

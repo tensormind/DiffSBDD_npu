@@ -2,12 +2,18 @@ import argparse
 from pathlib import Path
 
 import torch
+import torch_npu
+from torch_npu.contrib import transfer_to_npu
 from openbabel import openbabel
 openbabel.obErrorLog.StopLogging()  # suppress OpenBabel messages
 
 import utils
 from lightning_modules import LigandPocketDDPM
+import time
 
+# The ckpt stores hyperparameters as argparse.Namespace; torch >= 2.6 defaults
+# torch.load to weights_only=True and rejects it unless allowlisted.
+torch.serialization.add_safe_globals([argparse.Namespace])
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -47,6 +53,7 @@ if __name__ == "__main__":
         num_nodes_lig = None
 
     molecules = []
+    start_time = time.time()
     for i in range(args.n_samples // args.batch_size):
         molecules_batch = model.generate_ligands(
             args.pdbfile, args.batch_size, args.resi_list, args.ref_ligand,
@@ -57,4 +64,6 @@ if __name__ == "__main__":
         molecules.extend(molecules_batch)
 
     # Make SDF files
+    end_time = time.time()
+    print(f"[Timing] this round use time: {end_time - start_time:.2f} 秒")
     utils.write_sdf_file(args.outfile, molecules)

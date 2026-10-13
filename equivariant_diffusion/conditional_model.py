@@ -1,9 +1,10 @@
 import math
+import os
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch_scatter import scatter_add, scatter_mean
+from scatter_ops import scatter_add, scatter_mean
 
 import utils
 from equivariant_diffusion.en_diffusion import EnVariationalDiffusion
@@ -16,6 +17,11 @@ class ConditionalDDPM(EnVariationalDiffusion):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         assert not self.dynamics.update_pocket_coords
+        # L2 round-state; None = outside a sampling round (baseline behavior).
+        self._round_n_samples = None
+        # L4: aclgraph capture/replay of the dynamics step; None until the
+        # first denoising step of a round captures the graph.
+        self._dyn_graph = None
 
     def kl_prior(self, xh_lig, mask_lig, num_nodes):
         """Computes the KL between q(z1 | x) and the prior p(z1) = Normal(0, 1).
@@ -116,8 +122,17 @@ class ConditionalDDPM(EnVariationalDiffusion):
         gamma_0 = self.gamma(t_zeros)
         # Computes sqrt(sigma_0^2 / alpha_0^2)
         sigma_x = self.SNR(-0.5 * gamma_0)
-        net_out_lig, _ = self.dynamics(
-            z0_lig, xh0_pocket, t_zeros, lig_mask, pocket_mask)
+        wx = getattr(self, '_wx', None)
+        if wx is not None and getattr(wx, '_be', None) is not None:
+            # L6: final decode through the static edge tables. The eager
+            # dynamic-shape nonzero here is pathological (seconds) on graph
+            # pool memory; the table + eager mask is semantically identical
+            # (L5 membership check).
+            net_out_lig, _ = wx.final_egnn(
+                z0_lig, xh0_pocket, t_zeros, lig_mask, pocket_mask)
+        else:
+            net_out_lig, _ = self.dynamics(
+                z0_lig, xh0_pocket, t_zeros, lig_mask, pocket_mask)
 
         # Compute mu for p(zs | zt).
         mu_x_lig = self.compute_x_pred(net_out_lig, z0_lig, gamma_0, lig_mask)
@@ -155,7 +170,8 @@ class ConditionalDDPM(EnVariationalDiffusion):
         out_lig[:, :self.n_dims], xh_pocket[:, :self.n_dims] = \
             self.remove_mean_batch(out_lig[:, :self.n_dims],
                                    xh0_pocket[:, :self.n_dims],
-                                   lig_mask, pocket_mask)
+                                   lig_mask, pocket_mask,
+                                   dim_size=self._round_n_samples)
 
         return out_lig, xh_pocket
 
@@ -442,8 +458,18 @@ class ConditionalDDPM(EnVariationalDiffusion):
         sigma_t = self.sigma(gamma_t, target_tensor=zt_lig)
 
         # Neural net prediction.
-        eps_t_lig, _ = self.dynamics(
-            zt_lig, xh0_pocket, t, ligand_mask, pocket_mask)
+        if getattr(self, '_l6_force_eager', None) is not None:
+            # L6_VERIFY probe reference: pure eager (no graph). A second
+            # NPU graph over the same dynamics would alias the L6 graph's
+            # pool storage and clobber _round_edges_ok.
+            eps_t_lig, _ = self.dynamics(
+                zt_lig, xh0_pocket, t, ligand_mask, pocket_mask)
+        else:
+            if self._dyn_graph is None:
+                from equivariant_diffusion.graphs import DynGraph
+                self._dyn_graph = DynGraph(self.dynamics)
+            eps_t_lig, _ = self._dyn_graph.step(
+                zt_lig, xh0_pocket, t, ligand_mask, pocket_mask)
 
         # Compute mu for p(zs | zt).
         # Note: mu_{t->s} = 1 / alpha_{t|s} z_t - sigma_{t|s}^2 / sigma_t / alpha_{t|s} epsilon
@@ -459,8 +485,9 @@ class ConditionalDDPM(EnVariationalDiffusion):
         zs_lig, xh0_pocket = self.sample_normal_zero_com(
             mu_lig, xh0_pocket, sigma, ligand_mask, pocket_mask, fix_noise)
 
-        self.assert_mean_zero_with_mask(zt_lig[:, :self.n_dims], ligand_mask)
-
+        # L2: per-step COM check removed. It is enforced by construction
+        # (remove_mean_batch projects to COM-zero every step) and only acts
+        # as a canary; the final tensors are validated once per round below.
         return zs_lig, xh0_pocket
 
     def sample_combined_position_feature_noise(self, lig_indices, xh0_pocket,
@@ -486,6 +513,9 @@ class ConditionalDDPM(EnVariationalDiffusion):
         assert 0 < return_frames <= timesteps
         assert timesteps % return_frames == 0
 
+        import time as _time
+        _t_sgp = _time.perf_counter()
+
         n_samples = len(pocket['size'])
         device = pocket['x'].device
 
@@ -509,21 +539,81 @@ class ConditionalDDPM(EnVariationalDiffusion):
 
         self.assert_mean_zero_with_mask(z_lig[:, :self.n_dims], lig_mask)
 
+        # L2: round-invariant constants. n_samples is the same for all T
+        # steps, so thread it down once and defer the per-step checks to a
+        # single sync at the end of the round.
+        self._round_n_samples = n_samples
+        self.dynamics._round_n_samples = n_samples
+        self.dynamics.reset_round_checks(z_lig)
+        # L4: re-capture per round (pocket / n_samples shapes are round-level).
+        self._dyn_graph = None
+        # L6: capture the WHOLE denoising step (EGNN + diffusion physics +
+        # noise injection + COM projection) as one NPU graph. Off with L6_OFF
+        # (falls back to the L5 per-step wrapper at the end of this function).
+        self._wx = None
+        _l6_probe = None
+        if not os.environ.get('L6_OFF'):
+            if os.environ.get('L6_VERIFY'):
+                # Correctness anchor BEFORE any NPU graph exists: evaluate one
+                # eager denoising step on the round-start state. on torch_npu
+                # the graph pool aliases the caching allocator, so substantial
+                # eager compute running AFTER a capture/replay destroys the
+                # replay's pool storage (MTE out-of-range in the next replay).
+                # Doing the reference first keeps the graph pool pristine for
+                # the whole loop.
+                _z0 = z_lig.detach().clone()
+                _p0 = xh_pocket.detach().clone()
+                _sf = timesteps - 1
+                _s_arr = torch.full((n_samples, 1), _sf,
+                                    device=_z0.device) / timesteps
+                _t_arr = torch.full((n_samples, 1), _sf + 1,
+                                    device=_z0.device) / timesteps
+                orig_sg = self.sample_gaussian
+                self.sample_gaussian = \
+                    lambda size, device: torch.zeros(size, device=device)
+                self._l6_force_eager = True
+                try:
+                    z_eager, p_eager = self.sample_p_zs_given_zt(
+                        _s_arr, _t_arr, _z0, _p0, lig_mask, pocket['mask'])
+                finally:
+                    self._l6_force_eager = None
+                    self.sample_gaussian = orig_sg
+                _l6_probe = (_z0, _p0, z_eager, p_eager,
+                             lig_mask, pocket['mask'])
+            from equivariant_diffusion.graphs import AclGraphStepWrapper
+            self._wx = AclGraphStepWrapper(self, timesteps)
+            z_lig, xh_pocket = self._wx.wrap(
+                z_lig, xh_pocket, lig_mask, pocket['mask'])
+            if _l6_probe is not None:
+                self._verify_l6_step(*_l6_probe, n_samples, timesteps)
+
         out_lig = torch.zeros((return_frames,) + z_lig.size(),
                               device=z_lig.device)
         out_pocket = torch.zeros((return_frames,) + xh_pocket.size(),
                                  device=device)
 
         # Iteratively sample p(z_s | z_t) for t = 1, ..., T, with s = t - 1.
+        if os.environ.get('DYN_TIMER'):
+            print(f"[sgn] prep_to_loop={_time.perf_counter()-_t_sgp:.3f}s")
+        _loop_t0 = _time.perf_counter()
         for s in reversed(range(0, timesteps)):
-            s_array = torch.full((n_samples, 1), fill_value=s,
-                                 device=z_lig.device)
-            t_array = s_array + 1
-            s_array = s_array / timesteps
-            t_array = t_array / timesteps
+            if os.environ.get('L6_DEBUG') and s % 100 == 0:
+                if self.dynamics._round_edges_ok is not None:
+                    print(f"[dbg] s={s} edges_ok="
+                          f"{int(self.dynamics._round_edges_ok.item())}",
+                          flush=True)
+            if self._wx is not None:
+                z_lig, xh_pocket = self._wx.step(s)
+            else:
+                s_array = torch.full((n_samples, 1), fill_value=s,
+                                     device=z_lig.device)
+                t_array = s_array + 1
+                s_array = s_array / timesteps
+                t_array = t_array / timesteps
 
-            z_lig, xh_pocket = self.sample_p_zs_given_zt(
-                s_array, t_array, z_lig, xh_pocket, lig_mask, pocket['mask'])
+                z_lig, xh_pocket = self.sample_p_zs_given_zt(
+                    s_array, t_array, z_lig, xh_pocket, lig_mask,
+                    pocket['mask'])
 
             # save frame
             if (s * return_frames) % timesteps == 0:
@@ -532,25 +622,79 @@ class ConditionalDDPM(EnVariationalDiffusion):
                     self.unnormalize_z(z_lig, xh_pocket)
 
         # Finally sample p(x, h | z_0).
+        _loop_t1 = _time.perf_counter()
+        if os.environ.get('DYN_TIMER'):
+            print(f"[loop] total={_loop_t1-_loop_t0:.3f}s "
+                  f"({(_loop_t1-_loop_t0)/timesteps*1e3:.2f}ms/step)")
+        if os.environ.get('DYN_TIMER'):
+            _t_s0 = _time.perf_counter()
+            torch.npu.synchronize()
+            print(f"[sync] loop_end_sync={_time.perf_counter()-_t_s0:.3f}s")
+        _pf_t0 = _time.perf_counter()
         x_lig, h_lig, x_pocket, h_pocket = self.sample_p_xh_given_z0(
             z_lig, xh_pocket, lig_mask, pocket['mask'], n_samples)
+        if os.environ.get('DYN_TIMER'):
+            print(f"[final_decode] {_time.perf_counter()-_pf_t0:.3f}s")
+        _t_pf1 = _time.perf_counter()
+
+        # L2: single sync point for the whole round's numerical guards.
+        # The per-step canaries are deferred here: the final outputs are
+        # validated once. A NaN mid-round would have raised in eval baseline;
+        # it also propagates into the final tensors, so the finite check
+        # above preserves the observable contract (fail loudly, never return
+        # garbage). COM-zero holds by construction (remove_mean_batch projects
+        # every step) and is re-checked by assert_mean_zero_with_mask below.
+        self.dynamics.end_round_checks()
+        if os.environ.get('DYN_TIMER') or os.environ.get('PERSTEP'):
+            if self._wx is not None:
+                g = self._wx
+                print(f"[AclGraphStep] captures={g.n_captures} "
+                      f"host_fill={g._tb:.3f}s replay={g._te:.3f}s "
+                      f"steps={g._step_count} "
+                      f"fill_pstep={g._tb/max(g._step_count,1)*1e3:.2f}ms "
+                      f"replay_pstep={g._te/max(g._step_count,1)*1e3:.2f}ms "
+                      f"tables {g.table_sizes}"
+                      + (f" PERSTEP_device={g._sync/max(g._step_count,1)*1e3:.3f}ms"
+                         f" PERSTEP_wall={g._sync_host/max(g._step_count,1)*1e3:.3f}ms"
+                         if os.environ.get('PERSTEP') else ""))
+            elif self._dyn_graph is not None:
+                g = self._dyn_graph
+                print(f"[DynGraph] captures={g.n_captures} "
+                      f"eager_extract={g._tb:.3f}s fill+replay={g._te:.3f}s "
+                      f"steps={g._step_count} "
+                      f"per_step_replay={g._te/max(g._step_count,1)*1e3:.2f}ms")
+        self._round_n_samples = None
+        self.dynamics._round_n_samples = None
+        _t_rt1 = _time.perf_counter()
+        assert torch.isfinite(x_lig).all() and torch.isfinite(x_pocket).all(), \
+            "NaN detected in generated coordinates"
+        _t_rt2 = _time.perf_counter()
 
         self.assert_mean_zero_with_mask(x_lig, lig_mask)
+        _t_rt3 = _time.perf_counter()
 
         # Correct CoM drift for examples without intermediate states
         if return_frames == 1:
             max_cog = scatter_add(x_lig, lig_mask, dim=0).abs().max().item()
+            _t_rt4 = _time.perf_counter()
             if max_cog > 5e-2:
                 print(f'Warning CoG drift with error {max_cog:.3f}. Projecting '
                       f'the positions down.')
                 x_lig, x_pocket = self.remove_mean_batch(
                     x_lig, x_pocket, lig_mask, pocket['mask'])
+        if os.environ.get('DYN_TIMER'):
+            print(f"[rt] checks={_t_rt1-_t_pf1:.3f}s "
+                  f"isfinite={_t_rt2-_t_rt1:.3f}s "
+                  f"mean0={_t_rt3-_t_rt2:.3f}s "
+                  f"cog={_t_rt4-_t_rt3:.3f}s")
 
         # Overwrite last frame with the resulting x and h.
         out_lig[0] = torch.cat([x_lig, h_lig], dim=1)
         out_pocket[0] = torch.cat([x_pocket, h_pocket], dim=1)
 
         # remove frame dimension if only the final molecule is returned
+        if os.environ.get('DYN_TIMER'):
+            print(f"[sgn] final_to_ret={_time.perf_counter()-_t_pf1:.3f}s")
         return out_lig.squeeze(0), out_pocket.squeeze(0), lig_mask, \
                pocket['mask']
 
@@ -685,11 +829,44 @@ class ConditionalDDPM(EnVariationalDiffusion):
         return out_lig.squeeze(0), out_pocket.squeeze(0), ligand['mask'], \
                pocket['mask']
 
+    def _verify_l6_step(self, z0, p0, z_eager, p_eager, lig_mask, pocket_mask,
+                        n_samples, timesteps):
+        """L6_VERIFY=1: replay the freshly-captured L6 graph ONCE and compare
+        against the eager reference computed BEFORE the capture (see caller
+        for why pre-capture: torch_npu pool aliasing). Restores the buffers
+        to the round-start state afterwards."""
+        wx = self._wx
+        b = wx._buf
+        s_first = timesteps - 1
+        b['s'].fill_(float(s_first))
+        b['e'].zero_()
+        wx._g.replay()
+        if os.environ.get('L6_DEBUG') and self.dynamics._round_edges_ok is not None:
+            print(f"[dbg] after l6 replay edges_ok="
+                  f"{int(self.dynamics._round_edges_ok.item())}", flush=True)
+        z_graph = b['z'].detach().clone()
+        p_graph = b['p'].detach().clone()
+
+        # restore the true round-start state for the real loop
+        b['z'].copy_(z0)
+        b['p'].copy_(p0)
+
+        dz = (z_graph - z_eager).abs().max().item()
+        dp = (p_graph - p_eager).abs().max().item()
+        rel = dz / max(z_eager.abs().max().item(), 1e-6)
+        print(f"[L6 verify] step s={s_first} max|dz|={dz:.3e} "
+              f"max|dp|={dp:.3e} rel={rel:.3e}", flush=True)
+        if dz > 1e-3 and rel > 1e-4:
+            raise AssertionError("L6 step diverges from eager reference")
+
     @classmethod
-    def remove_mean_batch(cls, x_lig, x_pocket, lig_indices, pocket_indices):
+    def remove_mean_batch(cls, x_lig, x_pocket, lig_indices, pocket_indices,
+                          dim_size=None):
 
         # Just subtract the center of mass of the sampled part
-        mean = scatter_mean(x_lig, lig_indices, dim=0)
+        # (L2: dim_size == n_samples is round-invariant; callers pass it to
+        # avoid the int(index.max())+1 sync inside scatter_mean).
+        mean = scatter_mean(x_lig, lig_indices, dim=0, dim_size=dim_size)
 
         x_lig = x_lig - mean[lig_indices]
         x_pocket = x_pocket - mean[pocket_indices]
@@ -715,7 +892,8 @@ class SimpleConditionalDDPM(ConditionalDDPM):
         return input_size * self.n_dims
 
     @classmethod
-    def remove_mean_batch(cls, x_lig, x_pocket, lig_indices, pocket_indices):
+    def remove_mean_batch(cls, x_lig, x_pocket, lig_indices, pocket_indices,
+                          dim_size=None):
         """ Hacky way of removing the centering steps without changing too much
         code. """
         return x_lig, x_pocket

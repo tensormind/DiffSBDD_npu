@@ -7,6 +7,9 @@ import torch
 from rdkit import Chem
 from tqdm import tqdm
 
+# ckpts store hparams as argparse.Namespace; torch >= 2.6 blocks it by default.
+torch.serialization.add_safe_globals([argparse.Namespace])
+
 from lightning_modules import LigandPocketDDPM
 from analysis.molecule_builder import process_molecule
 import utils

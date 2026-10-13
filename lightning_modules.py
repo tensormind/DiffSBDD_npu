@@ -1,4 +1,5 @@
 import math
+import os
 from argparse import Namespace
 from typing import Optional
 from time import time
@@ -10,9 +11,9 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import pytorch_lightning as pl
 import wandb
-from torch_scatter import scatter_add, scatter_mean
+from scatter_ops import scatter_add, scatter_mean
 from Bio.PDB import PDBParser
-from Bio.PDB.Polypeptide import three_to_one
+from bio_aa_utils import three_to_one
 
 from constants import dataset_params, FLOAT_TYPE, INT_TYPE
 from equivariant_diffusion.dynamics import EGNNDynamics
@@ -835,14 +836,19 @@ class LigandPocketDDPM(pl.LightningModule):
 
         # Use conditional generation
         elif type(self.ddpm) == ConditionalDDPM:
+            _t_ph0 = time()
             xh_lig, xh_pocket, lig_mask, pocket_mask = \
                 self.ddpm.sample_given_pocket(pocket, num_nodes_lig,
                                               timesteps=timesteps)
+            if os.environ.get('DYN_TIMER'):
+                print(f"[phase] prep+sampling={time()-_t_ph0:.3f}s", flush=True)
+            import sys; sys.stdout.flush()
 
         else:
             raise NotImplementedError
 
         # Move generated molecule back to the original pocket position
+        _t_ph1 = time()
         pocket_com_after = scatter_mean(
             xh_pocket[:, :self.x_dims], pocket_mask, dim=0)
 
@@ -855,6 +861,9 @@ class LigandPocketDDPM(pl.LightningModule):
         x = xh_lig[:, :self.x_dims].detach().cpu()
         atom_type = xh_lig[:, self.x_dims:].argmax(1).detach().cpu()
         lig_mask = lig_mask.cpu()
+        _t_ph2 = time()
+        if os.environ.get('DYN_TIMER'):
+            print(f"[phase] com_shift+cpu={_t_ph2-_t_ph1:.3f}s", flush=True)
 
         molecules = []
         for mol_pc in zip(utils.batch_to_list(x, lig_mask),
@@ -868,6 +877,9 @@ class LigandPocketDDPM(pl.LightningModule):
                                    largest_frag=largest_frag)
             if mol is not None:
                 molecules.append(mol)
+
+        if os.environ.get('DYN_TIMER'):
+            print(f"[phase] mol_build={time()-_t_ph2:.3f}s", flush=True)
 
         return molecules
 

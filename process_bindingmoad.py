@@ -9,7 +9,8 @@ from tqdm import tqdm
 import numpy as np
 import torch
 from Bio.PDB import PDBParser
-from Bio.PDB.Polypeptide import three_to_one, is_aa
+from Bio.PDB.Polypeptide import is_aa
+from bio_aa_utils import three_to_one
 from Bio.PDB import PDBIO, Select
 from openbabel import openbabel
 from rdkit import Chem

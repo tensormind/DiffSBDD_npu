@@ -11,7 +11,8 @@ from tqdm import tqdm
 import numpy as np
 
 from Bio.PDB import PDBParser
-from Bio.PDB.Polypeptide import three_to_one, is_aa
+from Bio.PDB.Polypeptide import is_aa
+from bio_aa_utils import three_to_one
 from rdkit import Chem
 from scipy.ndimage import gaussian_filter
 

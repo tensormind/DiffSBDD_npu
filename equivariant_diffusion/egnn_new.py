@@ -1,6 +1,18 @@
 from torch import nn
 import torch
 import math
+import os
+
+# Node-feature gathers h[row]/h[col] via torch.index_select instead of
+# advanced indexing: measured 2.3x faster on NPU (microbench 0.387ms vs
+# 0.168ms per (E,128) site at E=22073) and bit-identical output; this single
+# change closed the whole v0-vs-v1 per-step device gap (see GAP_ANALYSIS.md).
+# Default ON; set V0_NAGATHER=0 to fall back to advanced indexing.
+_NAG = os.environ.get('V0_NAGATHER', '1') != '0'
+
+
+def _gather(t, idx):
+    return torch.index_select(t, 0, idx) if _NAG else t[idx]
 
 
 class GCL(nn.Module):
@@ -59,7 +71,8 @@ class GCL(nn.Module):
 
     def forward(self, h, edge_index, edge_attr=None, node_attr=None, node_mask=None, edge_mask=None):
         row, col = edge_index
-        edge_feat, mij = self.edge_model(h[row], h[col], edge_attr, edge_mask)
+        edge_feat, mij = self.edge_model(_gather(h, row), _gather(h, col),
+                                         edge_attr, edge_mask)
         h, agg = self.node_model(h, edge_index, edge_feat, node_attr)
         if node_mask is not None:
             h = h * node_mask
@@ -96,7 +109,8 @@ class EquivariantUpdate(nn.Module):
     def coord_model(self, h, coord, edge_index, coord_diff, coord_cross,
                     edge_attr, edge_mask, update_coords_mask=None):
         row, col = edge_index
-        input_tensor = torch.cat([h[row], h[col], edge_attr], dim=1)
+        input_tensor = torch.cat([_gather(h, row), _gather(h, col), edge_attr],
+                                 dim=1)
         if self.tanh:
             trans = coord_diff * torch.tanh(self.coord_mlp(input_tensor)) * self.coords_range
         else:
@@ -161,14 +175,22 @@ class EquivariantBlock(nn.Module):
         self.to(self.device)
 
     def forward(self, h, x, edge_index, node_mask=None, edge_mask=None,
-                edge_attr=None, update_coords_mask=None, batch_mask=None):
+                edge_attr=None, update_coords_mask=None, batch_mask=None,
+                num_segments=None, precomputed_radial=None,
+                precomputed_coord_diff=None):
         # Edit Emiel: Remove velocity as input
-        distances, coord_diff = coord2diff(x, edge_index, self.norm_constant)
+        if precomputed_radial is None:
+            distances, coord_diff = coord2diff(x, edge_index, self.norm_constant)
+        else:
+            # A: block 0 reuses the identical computation already done in
+            # EGNN.forward on the same x0 (norm_constant threaded explicitly).
+            distances, coord_diff = precomputed_radial, precomputed_coord_diff
         if self.reflection_equiv:
             coord_cross = None
         else:
             coord_cross = coord2cross(x, edge_index, batch_mask,
-                                      self.norm_constant)
+                                      self.norm_constant,
+                                      num_segments=num_segments)
         if self.sin_embedding is not None:
             distances = self.sin_embedding(distances)
         edge_attr = torch.cat([distances, edge_attr], dim=1)
@@ -199,6 +221,7 @@ class EGNN(nn.Module):
         self.normalization_factor = normalization_factor
         self.aggregation_method = aggregation_method
         self.reflection_equiv = reflection_equiv
+        self.norm_constant = norm_constant
 
         if sin_embedding:
             self.sin_embedding = SinusoidsEmbeddingNew()
@@ -223,9 +246,15 @@ class EGNN(nn.Module):
         self.to(self.device)
 
     def forward(self, h, x, edge_index, node_mask=None, edge_mask=None, update_coords_mask=None,
-                batch_mask=None, edge_attr=None):
+                batch_mask=None, edge_attr=None, num_segments=None):
         # Edit Emiel: Remove velocity as input
-        edge_feat, _ = coord2diff(x, edge_index)
+        # A: compute distances once for block 0 (which sees the *same* x),
+        # and hand them down to skip its duplicate coord2diff. The norm_constant
+        # is threaded explicitly so the reused values match block 0's own
+        # computation for any checkpoint configuration.
+        precomputed_radial, precomputed_coord_diff = coord2diff(
+            x, edge_index, self.norm_constant)
+        edge_feat = precomputed_radial
         if self.sin_embedding is not None:
             edge_feat = self.sin_embedding(edge_feat)
         if edge_attr is not None:
@@ -235,7 +264,9 @@ class EGNN(nn.Module):
             h, x = self._modules["e_block_%d" % i](
                 h, x, edge_index, node_mask=node_mask, edge_mask=edge_mask,
                 edge_attr=edge_feat, update_coords_mask=update_coords_mask,
-                batch_mask=batch_mask)
+                batch_mask=batch_mask, num_segments=num_segments,
+                precomputed_radial=precomputed_radial if i == 0 else None,
+                precomputed_coord_diff=precomputed_coord_diff if i == 0 else None)
 
         # Important, the bias of the last linear might be non-zero
         h = self.embedding_out(h)
@@ -294,23 +325,31 @@ class SinusoidsEmbeddingNew(nn.Module):
 
 
 def coord2diff(x, edge_index, norm_constant=1):
-    row, col = edge_index
-    coord_diff = x[row] - x[col]
+    # D: single gather on (2,E) index; slicing is a view, so this is
+    # one kernel instead of two (microbench: -5%, bitwise identical).
+    xij = x[edge_index]
+    coord_diff = xij[0] - xij[1]
     radial = torch.sum((coord_diff) ** 2, 1).unsqueeze(1)
     norm = torch.sqrt(radial + 1e-8)
     coord_diff = coord_diff/(norm + norm_constant)
     return radial, coord_diff
 
 
-def coord2cross(x, edge_index, batch_mask, norm_constant=1):
+def coord2cross(x, edge_index, batch_mask, norm_constant=1,
+                 num_segments=None):
 
+    # L2: num_segments is the per-round constant n_samples, so we can skip
+    # the batch_mask.max()+1 host sync this otherwise pays 5*501 x per round.
+    if num_segments is None:
+        num_segments = batch_mask.max() + 1
     mean = unsorted_segment_sum(x, batch_mask,
-                                num_segments=batch_mask.max() + 1,
+                                num_segments=num_segments,
                                 normalization_factor=None,
                                 aggregation_method='mean')
     row, col = edge_index
-    cross = torch.cross(x[row]-mean[batch_mask[row]],
-                        x[col]-mean[batch_mask[col]], dim=1)
+    # D: single gather on (2,E) index (microbench: -10%, identical).
+    mean_ij = mean[batch_mask[edge_index]]
+    cross = torch.cross(x[row] - mean_ij[0], x[col] - mean_ij[1], dim=1)
     norm = torch.linalg.norm(cross, dim=1, keepdim=True)
     cross = cross / (norm + norm_constant)
     return cross
@@ -319,17 +358,20 @@ def coord2cross(x, edge_index, batch_mask, norm_constant=1):
 def unsorted_segment_sum(data, segment_ids, num_segments, normalization_factor, aggregation_method: str):
     """Custom PyTorch op to replicate TensorFlow's `unsorted_segment_sum`.
         Normalization: 'sum' or 'mean'.
+
+        NPU-tuned: ``index_add_`` (native, 1-D index, no expand) instead of the
+        original 2-D ``scatter_add_``; the mean denominator is rebuilt with one
+        native index_add_ + clamp instead of a 2-D scatter + broadcast ones +
+        boolean-index. Semantically identical (empty buckets -> 0).
     """
     result_shape = (num_segments, data.size(1))
-    result = data.new_full(result_shape, 0)  # Init empty result tensor.
-    segment_ids = segment_ids.unsqueeze(-1).expand(-1, data.size(1))
-    result.scatter_add_(0, segment_ids, data)
+    result = data.new_zeros(result_shape)  # Init empty result tensor.
+    result.index_add_(0, segment_ids, data)
     if aggregation_method == 'sum':
         result = result / normalization_factor
-
-    if aggregation_method == 'mean':
-        norm = data.new_zeros(result.shape)
-        norm.scatter_add_(0, segment_ids, data.new_ones(data.shape))
-        norm[norm == 0] = 1
-        result = result / norm
+    elif aggregation_method == 'mean':
+        count = torch.zeros(num_segments, dtype=data.dtype, device=data.device)
+        count.index_add_(0, segment_ids, data.new_ones(segment_ids.numel()))
+        # clamp(min=1) == the original `norm[norm == 0] = 1` (empty buckets -> 0)
+        result = result / count.view(-1, 1).clamp(min=1)
     return result

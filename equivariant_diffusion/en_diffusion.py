@@ -5,7 +5,7 @@ import numpy as np
 import torch
 from torch import nn
 import torch.nn.functional as F
-from torch_scatter import scatter_add, scatter_mean
+from scatter_ops import scatter_add, scatter_mean
 
 import utils
 
@@ -267,8 +267,13 @@ class EnVariationalDiffusion(nn.Module):
         gamma_0 = self.gamma(t_zeros)
         # Computes sqrt(sigma_0^2 / alpha_0^2)
         sigma_x = self.SNR(-0.5 * gamma_0)
+        _fd0 = __import__('time').perf_counter()
         net_out_lig, net_out_pocket = self.dynamics(
             z0_lig, z0_pocket, t_zeros, lig_mask, pocket_mask)
+        _fd1 = __import__('time').perf_counter()
+        if __import__('os').environ.get('DYN_TIMER'):
+            print(f"[final_decode] dynamics={_fd1-_fd0:.3f}s",
+                  flush=True)
 
         # Compute mu for p(zs | zt).
         mu_x_lig = self.compute_x_pred(net_out_lig, z0_lig, gamma_0, lig_mask)
@@ -917,8 +922,11 @@ class EnVariationalDiffusion(nn.Module):
         return (input_size - 1) * self.n_dims
 
     @staticmethod
-    def remove_mean_batch(x, indices):
-        mean = scatter_mean(x, indices, dim=0)
+    def remove_mean_batch(x, indices, dim_size=None):
+        # L2: dim_size is a per-round constant (== n_samples). Passing it
+        # avoids the int(index.max())+1 host sync inside scatter_mean on every
+        # per-step call (dynamics.forward -> this -> scatter_ops.py:45).
+        mean = scatter_mean(x, indices, dim=0, dim_size=dim_size)
         x = x - mean[indices]
         return x
 
